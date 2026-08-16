@@ -1,7 +1,7 @@
 /**
  * @name VoiceHistory
  * @author 1posix
- * @version 0.10.0
+ * @version 0.10.1
  * @description Keeps a local history of users who recently left your current voice channel and displays the latest departure below active users.
  * @source https://github.com/1posix/discord-voice-history
  */
@@ -10,7 +10,7 @@ const PLUGIN_NAME = "VoiceHistory";
 const HISTORY_KEY = "history";
 const SETTINGS_KEY = "settings";
 const HISTORY_VERSION = 3;
-const PLUGIN_VERSION = "0.10.0";
+const PLUGIN_VERSION = "0.10.1";
 const COMPAT_HEALTH_INTERVAL_MS = 30_000;
 const COMPAT_PERIODIC_RESCAN_MS = 5 * 60_000;
 const COMPAT_REPAIR_COOLDOWN_MS = 20_000;
@@ -1851,6 +1851,17 @@ module.exports = class VoiceHistory {
                     activeBefore: previousActive.size,
                     activeAfter: nextActive.size
                 });
+
+                // Même notification bleue que pour les départs. On exclut
+                // explicitement notre propre compte pour ne pas afficher un
+                // toast lorsque VoiceHistory se synchronise sur notre join.
+                if (this.settings.diagnosticToasts && userId !== currentUserId) {
+                    BdApi.UI.showToast(`VoiceHistory: ${displayName} a rejoint le vocal`, {
+                        type: "info",
+                        timeout: 3500
+                    });
+                }
+
                 changed = this.removeHistoricalUser(nextChannelId, userId) || changed;
             }
             else {
@@ -2917,8 +2928,8 @@ module.exports = class VoiceHistory {
                         React.createElement("button", {onClick: () => plugin.runDisplayTest()}, "Lancer le test")
                     ),
                     row(
-                        "Toasts de diagnostic",
-                        "Affiche un toast lorsqu'un départ est réellement détecté. À désactiver une fois le plugin validé.",
+                        "Notifications vocales",
+                        "Affiche une notification bleue lorsqu'un utilisateur rejoint ou quitte le vocal suivi.",
                         checkbox("diagnosticToasts")
                     ),
                     row(
