@@ -1,7 +1,7 @@
 /**
  * @name VoiceHistory
  * @author 1posix
- * @version 0.9.2
+ * @version 0.10.0
  * @description Keeps a local history of users who recently left your current voice channel and displays the latest departure below active users.
  * @source https://github.com/1posix/discord-voice-history
  */
@@ -10,7 +10,7 @@ const PLUGIN_NAME = "VoiceHistory";
 const HISTORY_KEY = "history";
 const SETTINGS_KEY = "settings";
 const HISTORY_VERSION = 3;
-const PLUGIN_VERSION = "0.9.2";
+const PLUGIN_VERSION = "0.10.0";
 const COMPAT_HEALTH_INTERVAL_MS = 30_000;
 const COMPAT_PERIODIC_RESCAN_MS = 5 * 60_000;
 const COMPAT_REPAIR_COOLDOWN_MS = 20_000;
