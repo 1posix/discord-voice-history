@@ -1,7 +1,7 @@
 /**
  * @name VoiceHistory
  * @author 1posix
- * @version 0.9.0
+ * @version 0.9.2
  * @description Keeps a local history of users who recently left your current voice channel and displays the latest departure below active users.
  * @source https://github.com/1posix/discord-voice-history
  */
@@ -10,7 +10,7 @@ const PLUGIN_NAME = "VoiceHistory";
 const HISTORY_KEY = "history";
 const SETTINGS_KEY = "settings";
 const HISTORY_VERSION = 3;
-const PLUGIN_VERSION = "0.9.0";
+const PLUGIN_VERSION = "0.9.2";
 const COMPAT_HEALTH_INTERVAL_MS = 30_000;
 const COMPAT_PERIODIC_RESCAN_MS = 5 * 60_000;
 const COMPAT_REPAIR_COOLDOWN_MS = 20_000;
@@ -74,6 +74,16 @@ const STYLE = `
 
 .vh-recent-user:hover {
     background: var(--background-mod-subtle, rgba(255,255,255,.04));
+}
+
+.vh-recent-user[data-voice-history-user-id] {
+    cursor: pointer;
+}
+
+.vh-recent-user[data-voice-history-user-id]:focus-visible,
+.vh-history-entry[data-voice-history-user-id]:focus-visible {
+    outline: 2px solid var(--brand-500, #5865f2);
+    outline-offset: -2px;
 }
 
 .vh-recent-avatar,
@@ -209,6 +219,10 @@ const STYLE = `
 
 .vh-history-entry:hover {
     background: var(--background-modifier-hover, rgba(255,255,255,.06));
+}
+
+.vh-history-entry[data-voice-history-user-id] {
+    cursor: pointer;
 }
 
 .vh-history-entry-avatar,
@@ -379,8 +393,10 @@ module.exports = class VoiceHistory {
         this.SortedVoiceStateStore = null;
         this.ChannelStore = null;
         this.SelectedChannelStore = null;
+        this.SelectedGuildStore = null;
         this.RTCConnectionStore = null;
         this.UserStore = null;
+        this.UserProfileActions = null;
         this.GuildMemberStore = null;
         this.FluxDispatcher = null;
 
@@ -406,6 +422,8 @@ module.exports = class VoiceHistory {
         this.pendingDepartures = new Map();
 
         this.boundVoiceStore = null;
+        this.boundSelectedGuildStore = null;
+        this.boundSelectedChannelStore = null;
         this.boundFluxDispatcher = null;
         this.compatRepairScheduled = false;
         this.compat = {
@@ -434,6 +452,7 @@ module.exports = class VoiceHistory {
         this.historyPopoverCleanup = null;
 
         this.voiceStoreHandler = () => this.syncVoiceState();
+        this.navigationStoreHandler = () => this.onNavigationContextChanged();
         this.fluxVoiceHandler = (event) => this.onVoiceStateUpdates(event);
     }
 
@@ -634,6 +653,14 @@ module.exports = class VoiceHistory {
             hints: ["selected", "channel"]
         }));
 
+        assign("SelectedGuildStore", this.resolveStoreCompat("SelectedGuildStore", {
+            pool,
+            keys: [["getGuildId", "getLastSelectedGuildId"]],
+            validator: (m) => typeof m.getGuildId === "function"
+                && (typeof m.getLastSelectedGuildId === "function" || this.getModuleName(m).toLowerCase().includes("selected")),
+            hints: ["selected", "guild"]
+        }));
+
         assign("RTCConnectionStore", this.resolveStoreCompat("RTCConnectionStore", {
             pool,
             keys: [["getChannelId", "isConnected"]],
@@ -657,6 +684,38 @@ module.exports = class VoiceHistory {
         }));
 
         const {Webpack} = BdApi;
+
+        // Action non-store : ouverture du profil utilisateur. On privilégie le
+        // nom connu puis on scanne les exports par capacité pour survivre aux
+        // déplacements de modules Discord.
+        let profileActions = null;
+        let profileActionsSource = "introuvable";
+        const profileAttempts = [
+            ["getByKeys(openUserProfileModal)", () => Webpack.getByKeys?.("openUserProfileModal")],
+            ["scan openUserProfileModal", () => Webpack.getModule?.((module) => typeof module?.openUserProfileModal === "function")],
+            ["scan default.openUserProfileModal", () => Webpack.getModule?.((module) => typeof module?.default?.openUserProfileModal === "function")?.default],
+            ["scan profile-modal action", () => Webpack.getModule?.((module) => Boolean(
+                module && Object.keys(module).some((key) => typeof module[key] === "function" && /open.*user.*profile.*modal|open.*profile.*modal/i.test(key))
+            ))],
+            ["scan default profile-modal action", () => Webpack.getModule?.((module) => Boolean(
+                module?.default && Object.keys(module.default).some((key) => typeof module.default[key] === "function" && /open.*user.*profile.*modal|open.*profile.*modal/i.test(key))
+            ))?.default]
+        ];
+        for (const [label, read] of profileAttempts) {
+            try {
+                const candidate = read();
+                if (candidate && Object.keys(candidate).some((key) => typeof candidate[key] === "function" && /open.*user.*profile.*modal|open.*profile.*modal/i.test(key))) {
+                    profileActions = candidate;
+                    profileActionsSource = label;
+                    break;
+                }
+            }
+            catch (error) {
+                this.debugLog(`${label} a échoué`, error);
+            }
+        }
+        this.UserProfileActions = profileActions;
+        sources.UserProfileActions = profileActionsSource;
         let dispatcher = null;
         let dispatcherSource = "introuvable";
         const dispatcherAttempts = [
@@ -701,6 +760,8 @@ module.exports = class VoiceHistory {
             !this.ChannelStore ? "ChannelStore absent" : null,
             !this.UserStore ? "UserStore absent" : null,
             (!this.VoiceStateStore && !this.SortedVoiceStateStore) ? "stores vocaux absents" : null,
+            !this.SelectedGuildStore ? "SelectedGuildStore absent (ancrage DOM strict limité)" : null,
+            !this.UserProfileActions ? "action profil absente (clic profil indisponible)" : null,
             !this.FluxDispatcher ? "FluxDispatcher absent (polling actif)" : null
         ].filter(Boolean);
         this.debugLog(`Résolution compatibilité #${this.compat.generation} (${reason})`, sources);
@@ -708,6 +769,8 @@ module.exports = class VoiceHistory {
 
     bindRuntimeHooks() {
         this.boundVoiceStore = null;
+        this.boundSelectedGuildStore = null;
+        this.boundSelectedChannelStore = null;
         this.boundFluxDispatcher = null;
 
         if (typeof this.VoiceStateStore?.addChangeListener === "function") {
@@ -717,6 +780,26 @@ module.exports = class VoiceHistory {
             }
             catch (error) {
                 this.debugLog("addChangeListener VoiceStateStore indisponible", error);
+            }
+        }
+
+        if (typeof this.SelectedGuildStore?.addChangeListener === "function") {
+            try {
+                this.SelectedGuildStore.addChangeListener(this.navigationStoreHandler);
+                this.boundSelectedGuildStore = this.SelectedGuildStore;
+            }
+            catch (error) {
+                this.debugLog("addChangeListener SelectedGuildStore indisponible", error);
+            }
+        }
+
+        if (typeof this.SelectedChannelStore?.addChangeListener === "function") {
+            try {
+                this.SelectedChannelStore.addChangeListener(this.navigationStoreHandler);
+                this.boundSelectedChannelStore = this.SelectedChannelStore;
+            }
+            catch (error) {
+                this.debugLog("addChangeListener SelectedChannelStore indisponible", error);
             }
         }
 
@@ -736,11 +819,21 @@ module.exports = class VoiceHistory {
             try { this.boundVoiceStore.removeChangeListener(this.voiceStoreHandler); }
             catch (error) { this.debugLog("removeChangeListener a échoué", error); }
         }
+        if (this.boundSelectedGuildStore?.removeChangeListener) {
+            try { this.boundSelectedGuildStore.removeChangeListener(this.navigationStoreHandler); }
+            catch (error) { this.debugLog("removeChangeListener SelectedGuildStore a échoué", error); }
+        }
+        if (this.boundSelectedChannelStore?.removeChangeListener) {
+            try { this.boundSelectedChannelStore.removeChangeListener(this.navigationStoreHandler); }
+            catch (error) { this.debugLog("removeChangeListener SelectedChannelStore a échoué", error); }
+        }
         if (this.boundFluxDispatcher?.unsubscribe) {
             try { this.boundFluxDispatcher.unsubscribe("VOICE_STATE_UPDATES", this.fluxVoiceHandler); }
             catch (error) { this.debugLog("unsubscribe VOICE_STATE_UPDATES a échoué", error); }
         }
         this.boundVoiceStore = null;
+        this.boundSelectedGuildStore = null;
+        this.boundSelectedChannelStore = null;
         this.boundFluxDispatcher = null;
     }
 
@@ -1089,6 +1182,122 @@ module.exports = class VoiceHistory {
         );
         if (vocalByMethod || type === 2 || type === 13) return id;
         return null;
+    }
+
+    getSelectedGuildId() {
+        const direct = this.callReadMethod(
+            this.SelectedGuildStore,
+            ["getGuildId", "getSelectedGuildId"],
+            [[]],
+            (value) => value == null || /^\d{15,22}$/.test(String(value))
+        );
+        if (direct?.value) return String(direct.value);
+
+        // Fallback : déduire le serveur depuis le canal texte actuellement
+        // sélectionné. En DM le canal n'a pas de guildId => null.
+        const selected = this.callReadMethod(
+            this.SelectedChannelStore,
+            ["getCurrentlySelectedChannelId", "getChannelId", "getLastSelectedChannelId"],
+            [[]],
+            (value) => value == null || /^\d{15,22}$/.test(String(value))
+        );
+        const selectedChannel = selected?.value ? this.getChannel(String(selected.value)) : null;
+        try {
+            return selectedChannel?.guild_id ?? selectedChannel?.guildId ?? selectedChannel?.getGuildId?.() ?? null;
+        }
+        catch {
+            return selectedChannel?.guild_id ?? selectedChannel?.guildId ?? null;
+        }
+    }
+
+    isTrackedGuildCurrentlyVisible() {
+        if (!this.currentChannelId || !this.currentGuildId) return false;
+        const selectedGuildId = this.getSelectedGuildId();
+        return Boolean(selectedGuildId && String(selectedGuildId) === String(this.currentGuildId));
+    }
+
+    onNavigationContextChanged() {
+        if (!this.started) return;
+
+        // La connexion vocale reste active lorsqu'on visite un autre serveur
+        // ou les DM. Dans ce contexte la vraie liste du salon suivi n'est plus
+        // affichée : VoiceHistory se masque au lieu de migrer près du panneau
+        // « Voice Connected » ou du profil local.
+        if (!this.isTrackedGuildCurrentlyVisible()) {
+            this.closeHistoryPopover();
+            this.removeRenderedLists();
+            this.lastRenderMode = "masqué-navigation";
+            this.lastTargetDetails = "serveur vocal suivi non affiché";
+            return;
+        }
+
+        this.scheduleRender();
+    }
+
+    getProfileActionMethods() {
+        if (!this.UserProfileActions) return [];
+        const preferred = ["openUserProfileModal", "openUserProfile", "openProfileModal"];
+        const dynamic = Object.keys(this.UserProfileActions).filter((key) => (
+            typeof this.UserProfileActions[key] === "function"
+            && /open.*user.*profile.*modal|open.*profile.*modal/i.test(key)
+        ));
+        return [...new Set([...preferred, ...dynamic])].filter((name) => typeof this.UserProfileActions?.[name] === "function");
+    }
+
+    openUserProfile(userId) {
+        const id = String(userId ?? "");
+        if (!/^\d{15,22}$/.test(id)) return false;
+
+        if (!this.UserProfileActions) {
+            this.repairCompatibility("action profil utilisateur introuvable", true);
+        }
+
+        const methods = this.getProfileActionMethods();
+        const payload = {
+            userId: id,
+            guildId: this.currentGuildId ?? undefined,
+            channelId: this.currentChannelId ?? undefined
+        };
+
+        for (const method of methods) {
+            try {
+                this.UserProfileActions[method](payload);
+                this.debugLog("Profil utilisateur ouvert", {userId: id, method});
+                return true;
+            }
+            catch (error) {
+                this.debugLog(`Ouverture profil via ${method} impossible`, error);
+            }
+        }
+
+        BdApi.UI.showToast("VoiceHistory: impossible d'ouvrir ce profil sur ce build Discord.", {type: "warning", timeout: 3500});
+        return false;
+    }
+
+    makeProfileClickable(element, userId) {
+        const id = String(userId ?? "");
+        if (!(element instanceof HTMLElement) || !/^\d{15,22}$/.test(id)) return;
+
+        element.dataset.voiceHistoryUserId = id;
+        element.setAttribute("role", "button");
+        element.setAttribute("tabindex", "0");
+
+        const activate = (event) => {
+            if (event?.target?.closest?.(".vh-history-button")) return;
+            event?.preventDefault?.();
+            event?.stopPropagation?.();
+
+            // Fermer d'abord l'historique : le modal de profil Discord doit
+            // toujours passer au premier plan sans conserver notre popover
+            // au-dessus de lui.
+            this.closeHistoryPopover();
+            this.openUserProfile(id);
+        };
+        element.addEventListener("click", activate);
+        element.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            activate(event);
+        });
     }
 
     getCurrentVoiceChannelId() {
@@ -1885,6 +2094,17 @@ module.exports = class VoiceHistory {
                 (node) => node.dataset.voiceHistoryChannel === String(this.currentChannelId)
             );
 
+            // Quand on visite un autre serveur ou les DM, Discord conserve la
+            // connexion vocale en bas de la sidebar. On retire notre bloc : il
+            // ne doit jamais s'accrocher à ce panneau ou au profil local.
+            if (!this.isTrackedGuildCurrentlyVisible()) {
+                if (hasRenderedList) {
+                    this.closeHistoryPopover();
+                    this.removeRenderedLists();
+                }
+                return;
+            }
+
             // Discord reconstruit parfois la liste des salons. On ne rerend que
             // si notre bloc a réellement disparu, pas à chaque mutation du DOM.
             if (hasRecentUsers && !hasRenderedList) this.scheduleRender();
@@ -1978,7 +2198,7 @@ module.exports = class VoiceHistory {
         return best || element;
     }
 
-    findChannelElement(channelId, guildId) {
+    findChannelElement(channelId, guildId, {strict = false} = {}) {
         if (!channelId) return null;
         const id = String(channelId);
         const escaped = CSS.escape(id);
@@ -2007,7 +2227,11 @@ module.exports = class VoiceHistory {
             if (anchor && this.isVisibleElement(anchor)) return anchor;
         }
 
-        // Fallback 0.4 : on retrouve le nom réellement affiché du salon dans la colonne de gauche.
+        if (strict) return null;
+
+        // Fallback historique : recherche par texte. Il n'est jamais utilisé
+        // pour l'ancrage principal car le même nom peut apparaître dans le
+        // panneau de connexion vocale ou sur un autre serveur.
         const channelName = this.getChannelName(channelId);
         const byText = this.findVisibleTextElements(channelName);
         if (byText.length > 0) return byText[0];
@@ -2103,74 +2327,44 @@ module.exports = class VoiceHistory {
             candidates.push({mode, mount, after: after || null, details});
         };
 
+        // Ancrage strict : uniquement dans le serveur réellement affiché.
+        const selectedGuildId = this.getSelectedGuildId();
+        if (!selectedGuildId || !guildId || String(selectedGuildId) !== String(guildId)) {
+            this.lastTargetDetails = `ancrage refusé: serveur affiché=${selectedGuildId || "DM/aucun"}, serveur vocal=${guildId || "inconnu"}`;
+            return candidates;
+        }
+
         const activeRows = this.findActiveVoiceRows(channelId);
-        const channelElement = this.findChannelElement(channelId, guildId);
-
-        // V0.5 : Discord rend actuellement souvent le salon dans un li.containerDefault.
-        // Il ne faut PAS injecter à l'intérieur de ce LI : il peut être contraint/clippé.
-        // On remonte à son parent et on insère après le LI complet.
-        if (channelElement) {
-            const channelItem = this.findChannelListItem(channelElement);
-            const listParent = channelItem?.parentElement;
-            if (channelItem && listParent) {
-                let after = channelItem;
-
-                // Si les participants sont des frères du salon, avancer jusqu'au dernier participant.
-                for (const row of activeRows) {
-                    const direct = this.getDirectChildUnder(listParent, row);
-                    if (!direct) continue;
-                    if (direct === channelItem || channelItem.contains(direct)) continue;
-                    const relation = channelItem.compareDocumentPosition(direct);
-                    if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
-                        if (after === channelItem || (after.compareDocumentPosition(direct) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-                            after = direct;
-                        }
-                    }
-                }
-
-                add(
-                    "channel-li-parent",
-                    listParent,
-                    after,
-                    `channelItem=${this.elementDebugKey(channelItem)}; after=${this.elementDebugKey(after)}; activeRows=${activeRows.length}`
-                );
-            }
+        const channelElement = this.findChannelElement(channelId, guildId, {strict: true});
+        if (!channelElement) {
+            this.lastTargetDetails = "ancrage refusé: ligne exacte du salon vocal absente";
+            return candidates;
         }
 
-        // Deuxième choix : les lignes des participants ont réellement le même parent.
-        if (activeRows.length > 0) {
-            const sameParent = activeRows[0].parentElement
-                && activeRows.every((row) => row.parentElement === activeRows[0].parentElement);
-            if (sameParent) {
-                add(
-                    "visible-voice-row-parent",
-                    activeRows[0].parentElement,
-                    activeRows[activeRows.length - 1],
-                    `activeRows=${activeRows.length}; mêmes parents`
-                );
-            }
-
-            const common = this.findCommonParent(activeRows);
-            if (common?.parentElement) {
-                const direct = this.getDirectChildUnder(common.parentElement, common) || common;
-                add(
-                    "visible-voice-common-parent",
-                    common.parentElement,
-                    direct.parentElement === common.parentElement ? direct : null,
-                    `activeRows=${activeRows.length}; ancêtre commun`
-                );
-            }
+        const channelItem = this.findChannelListItem(channelElement);
+        const listParent = channelItem?.parentElement;
+        if (!channelItem || !listParent || channelItem.tagName !== "LI" || !["UL", "OL"].includes(listParent.tagName)) {
+            this.lastTargetDetails = `ancrage refusé: structure salon non sûre (${this.elementDebugKey(channelItem)} -> ${this.elementDebugKey(listParent)})`;
+            return candidates;
         }
 
-        // Dernier fallback : parent du nœud de salon, mais jamais à l'intérieur d'un LI containerDefault.
-        if (channelElement?.parentElement) {
-            const row = this.normalizeSidebarRow(channelElement);
-            if (row?.parentElement) {
-                add("normalized-channel-parent", row.parentElement, row, "fallback ligne normalisée");
-            }
+        let after = channelItem;
+        for (const row of activeRows) {
+            const direct = this.getDirectChildUnder(listParent, row);
+            if (!direct || direct === channelItem || channelItem.contains(direct)) continue;
+            const relation = channelItem.compareDocumentPosition(direct);
+            if (!(relation & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+            if (after === channelItem || (after.compareDocumentPosition(direct) & Node.DOCUMENT_POSITION_FOLLOWING)) after = direct;
         }
 
-        if (!candidates.length) this.lastTargetDetails = "aucun candidat DOM valide";
+        add(
+            "strict-channel-list",
+            listParent,
+            after,
+            `selectedGuild=${selectedGuildId}; channelItem=${this.elementDebugKey(channelItem)}; after=${this.elementDebugKey(after)}; activeRows=${activeRows.length}`
+        );
+
+        if (!candidates.length) this.lastTargetDetails = "aucun candidat DOM strict valide";
         return candidates;
     }
 
@@ -2242,6 +2436,14 @@ module.exports = class VoiceHistory {
             this.removeRenderedLists();
             if (!this.currentChannelId) {
                 if (popoverWasOpen) this.closeHistoryPopover();
+                return;
+            }
+
+            if (!this.isTrackedGuildCurrentlyVisible()) {
+                if (popoverWasOpen) this.closeHistoryPopover();
+                this.lastRenderMode = "masqué-navigation";
+                this.lastRenderError = null;
+                this.lastTargetDetails = "serveur vocal suivi non affiché";
                 return;
             }
 
@@ -2345,6 +2547,7 @@ module.exports = class VoiceHistory {
             row.appendChild(time);
         }
 
+        this.makeProfileClickable(row, visibleEntry.userId);
         list.appendChild(row);
         return list;
     }
@@ -2446,6 +2649,7 @@ module.exports = class VoiceHistory {
             main.appendChild(time);
 
             item.appendChild(main);
+            this.makeProfileClickable(item, entry.userId);
             historyList.appendChild(item);
         }
 
@@ -2560,7 +2764,7 @@ module.exports = class VoiceHistory {
             this.removeRenderedLists();
             const fake = [{
                 userId: "voicehistory-test",
-                displayName: "VoiceHistory — TEST V0.9",
+                displayName: "VoiceHistory — TEST V0.9.1",
                 username: "VoiceHistory",
                 avatarUrl: null,
                 bot: false,
@@ -2571,9 +2775,9 @@ module.exports = class VoiceHistory {
             if (!result) {
                 this.lastRenderMode = "TEST:overlay-fallback";
                 this.lastRenderError = `Tous les candidats sont invisibles : ${this.lastTargetDetails}`;
-                this.showDebugOverlay(`VoiceHistory V0.9 fonctionne, mais tous les points d'insertion testés sont invisibles.\n${this.lastTargetDetails}`);
+                this.showDebugOverlay(`VoiceHistory V0.9.1 fonctionne, mais tous les points d'insertion testés sont invisibles.\n${this.lastTargetDetails}`);
                 BdApi.UI.alert(
-                    "VoiceHistory — diagnostic V0.9",
+                    "VoiceHistory — diagnostic V0.9.1",
                     `Le test a essayé plusieurs niveaux DOM, mais aucun n'a produit une ligne visible.\n\n${this.lastTargetDetails}`
                 );
                 console.error(`[${PLUGIN_NAME}] Test affichage: aucun candidat visible`, this.getDebugStatus());
@@ -2584,10 +2788,10 @@ module.exports = class VoiceHistory {
             this.lastRenderError = null;
             const rect = result.list.getBoundingClientRect();
             BdApi.UI.alert(
-                "VoiceHistory — test V0.9 visible",
+                "VoiceHistory — test V0.9.1 visible",
                 `La ligne TEST a une surface visible (${Math.round(rect.width)}×${Math.round(rect.height)} px).\n\nMode : ${result.target.mode}\nDétails : ${this.lastTargetDetails}`
             );
-            console.info(`[${PLUGIN_NAME}] Test affichage V0.9 visible`, {
+            console.info(`[${PLUGIN_NAME}] Test affichage V0.9.1 visible`, {
                 mode: result.target.mode,
                 details: this.lastTargetDetails,
                 mount: result.target.mount,
@@ -2598,7 +2802,7 @@ module.exports = class VoiceHistory {
         catch (error) {
             this.lastRenderMode = "TEST:erreur";
             this.lastRenderError = String(error?.message || error);
-            this.showDebugOverlay(`VoiceHistory V0.9 : erreur pendant le test.\n${this.lastRenderError}`);
+            this.showDebugOverlay(`VoiceHistory V0.9.1 : erreur pendant le test.\n${this.lastRenderError}`);
             console.error(`[${PLUGIN_NAME}] Test affichage: erreur`, error);
         }
         finally {
@@ -2619,7 +2823,11 @@ module.exports = class VoiceHistory {
             voiceStore: Boolean(this.VoiceStateStore),
             sortedVoiceStore: Boolean(this.SortedVoiceStateStore),
             selectedChannelStore: Boolean(this.SelectedChannelStore),
+            selectedGuildStore: Boolean(this.SelectedGuildStore),
+            selectedGuildId: this.getSelectedGuildId(),
+            trackedGuildVisible: this.isTrackedGuildCurrentlyVisible(),
             rtcConnectionStore: Boolean(this.RTCConnectionStore),
+            userProfileActions: Boolean(this.UserProfileActions),
             channelSource: this.lastChannelSource,
             voiceUsersSource: this.lastVoiceUsersSource,
             voiceUsersAuthoritative: this.lastVoiceUsersAuthoritative,
@@ -2681,7 +2889,7 @@ module.exports = class VoiceHistory {
                 React.createElement(
                     "div",
                     {className: "vh-settings-section"},
-                    React.createElement("h3", null, "Diagnostic V0.9"),
+                    React.createElement("h3", null, "Diagnostic V0.9.1"),
                     React.createElement(
                         "div",
                         {className: "vh-debug-box"},

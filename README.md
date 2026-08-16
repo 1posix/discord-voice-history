@@ -12,6 +12,8 @@ VoiceHistory is a BetterDiscord plugin that keeps a local, temporary history of 
 - **Compact history:** Only one departed user is displayed, keeping the voice channel list clean.
 - **Previous departures:** A clock button opens the list of users who left before the latest one.
 - **Automatic promotion:** If the latest departed user rejoins, the previous departure automatically becomes visible.
+- **Clickable profiles:** Click the visible departed user or any entry in the history popover to open their Discord profile.
+- **Stable sidebar placement:** The history is only rendered when the tracked server's voice-channel list is actually visible, preventing it from drifting into Discord's voice connection or profile panels when switching servers or DMs.
 - **Relative time:** Displays how long ago the user left, refreshed every 10 seconds.
 - **Persistent history:** Keeps recent departures across Discord restarts, with a configurable retention period (24 hours by default).
 - **Local only:** History is stored locally through BetterDiscord. No external server or telemetry is used.
